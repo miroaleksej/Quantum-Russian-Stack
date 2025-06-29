@@ -1,0 +1,382 @@
+# quantum_russian_stack.py
+import asyncio
+import numpy as np
+import torch
+import torch.nn as nn
+from typing import Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+import os
+import json
+import yaml
+import psutil
+import time
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.kbkdf import KBKDF
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from mpi4py import MPI
+import aiohttp
+from aiohttp import web
+import socketio
+import logging
+from datetime import datetime, timedelta
+import hashlib
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('quantum_stack.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('QuantumRussianStack')
+
+# ======================
+# 1. КОНФИГУРАЦИЯ СИСТЕМЫ
+# ======================
+
+@dataclass
+class QRSConfig:
+    quantum_units: int = 1024
+    use_gpu: bool = True
+    use_mpi: bool = False
+    precision: str = 'float64'
+    security_level: int = 3
+    modules: Dict[str, Dict] = None
+    ani_control: bool = True
+    russian_tech: bool = True
+    gost_crypto: bool = True
+    monitoring: bool = True
+    web_interface: bool = True
+    web_port: int = 8080
+    key_rotation_interval: int = 3600  # в секундах
+
+    def __post_init__(self):
+        self.modules = self.modules or {
+            'qaoa': {'enabled': True, 'iterations': 100},
+            'qkd': {'enabled': True, 'key_bits': 256},
+            'qudit': {'enabled': True, 'levels': 3, 'physical_noise': True}
+        }
+
+# ======================
+# 2. МОДУЛЬ БЕЗОПАСНОСТИ И РОТАЦИИ КЛЮЧЕЙ
+# ======================
+
+class QuantumSecurityEngine:
+    def __init__(self, config: QRSConfig):
+        self.config = config
+        self.current_keys = {}
+        self.key_history = []
+        self._init_security()
+        self.rotation_task = None
+
+    def _init_security(self):
+        """Инициализация криптографических параметров"""
+        self.master_key = self._generate_master_key()
+        self._rotate_keys(initial=True)
+
+    def _generate_master_key(self) -> bytes:
+        """Генерация мастер-ключа системы"""
+        seed = os.urandom(32)
+        if self.config.gost_crypto:
+            h = hashlib.new('streebog256')
+        else:
+            h = hashlib.sha256()
+        h.update(seed)
+        return h.digest()
+
+    def _generate_key(self, key_type: str) -> bytes:
+        """Генерация ключа конкретного типа"""
+        kdf = KBKDF(
+            algorithm=hashes.GOST3411() if self.config.gost_crypto else hashes.SHA512(),
+            mode="counter",
+            length=32,
+            label=f"QRS_{key_type}_KEY".encode(),
+            context=self.master_key,
+        )
+        return kdf.derive(os.urandom(32))
+
+    def _rotate_keys(self, initial=False):
+        """Ротация всех ключей системы"""
+        new_keys = {
+            'encryption': self._generate_key('ENC'),
+            'authentication': self._generate_key('AUTH'),
+            'signature': self._generate_key('SIG'),
+            'rotation_time': datetime.now()
+        }
+        
+        if not initial:
+            self.key_history.append(self.current_keys)
+            if len(self.key_history) > 5:  # Храним историю последних 5 ключей
+                self.key_history.pop(0)
+        
+        self.current_keys = new_keys
+        logger.info(f"Keys rotated at {new_keys['rotation_time']}")
+
+    async def start_key_rotation(self):
+        """Запуск периодической ротации ключей"""
+        if self.config.key_rotation_interval <= 0:
+            return
+            
+        async def rotation_loop():
+            while True:
+                await asyncio.sleep(self.config.key_rotation_interval)
+                self._rotate_keys()
+                
+        self.rotation_task = asyncio.create_task(rotation_loop())
+
+    def encrypt(self, data: bytes) -> bytes:
+        """Шифрование данных с текущим ключом"""
+        iv = os.urandom(16)
+        algorithm = algorithms.GOST28147(self.current_keys['encryption'][:32]) if self.config.gost_crypto else algorithms.AES(self.current_keys['encryption'][:32])
+        cipher = Cipher(algorithm, modes.GCM(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        return iv + encryptor.update(data) + encryptor.finalize()
+
+    def decrypt(self, encrypted: bytes) -> bytes:
+        """Дешифрование данных"""
+        iv = encrypted[:16]
+        algorithm = algorithms.GOST28147(self.current_keys['encryption'][:32]) if self.config.gost_crypto else algorithms.AES(self.current_keys['encryption'][:32])
+        cipher = Cipher(algorithm, modes.GCM(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        return decryptor.update(encrypted[16:-16]) + decryptor.finalize()
+
+# ======================
+# 3. ВЕБ-ИНТЕРФЕЙС И МОНИТОРИНГ
+# ======================
+
+class QuantumWebInterface:
+    def __init__(self, processor, config: QRSConfig):
+        self.processor = processor
+        self.config = config
+        self.app = web.Application()
+        self.sio = socketio.AsyncServer(async_mode='aiohttp')
+        self.sio.attach(self.app)
+        self._setup_routes()
+
+    def _setup_routes(self):
+        """Настройка маршрутов веб-интерфейса"""
+        self.app.add_routes([
+            web.get('/', self.handle_index),
+            web.get('/metrics', self.handle_metrics),
+            web.get('/control', self.handle_control),
+            web.static('/static', 'static')
+        ])
+
+    async def handle_index(self, request):
+        """Главная страница"""
+        with open('templates/index.html') as f:
+            return web.Response(text=f.read(), content_type='text/html')
+
+    async def handle_metrics(self, request):
+        """API для получения метрик"""
+        metrics = await self._collect_metrics()
+        return web.json_response(metrics)
+
+    async def handle_control(self, request):
+        """API для управления системой"""
+        data = await request.json()
+        response = await self._handle_control_command(data)
+        return web.json_response(response)
+
+    async def _collect_metrics(self) -> Dict:
+        """Сбор метрик системы"""
+        metrics = {
+            'timestamp': datetime.now().isoformat(),
+            'system': {
+                'cpu_usage': psutil.cpu_percent(),
+                'memory_usage': psutil.virtual_memory().percent,
+                'temperature': self._get_cpu_temperature(),
+            },
+            'quantum': {
+                'qubit_error': 0.001,  # Замените реальными значениями
+                'gate_fidelity': 0.998,
+                'state_entropy': 0.75
+            },
+            'security': {
+                'last_key_rotation': self.processor.security.current_keys['rotation_time'].isoformat(),
+                'encryption_active': True,
+                'security_level': self.config.security_level
+            }
+        }
+        
+        await self.sio.emit('metrics_update', metrics)
+        return metrics
+
+    async def _handle_control_command(self, data: Dict) -> Dict:
+        """Обработка команд управления"""
+        command = data.get('command')
+        
+        if command == 'rotate_keys':
+            self.processor.security._rotate_keys()
+            return {'status': 'success', 'message': 'Keys rotated'}
+        
+        elif command == 'adjust_noise':
+            if 'qudit' in self.processor.modules:
+                level = data.get('level', 0.5)
+                self.processor.modules['qudit'].noise_level = max(0, min(1, float(level)))
+                return {'status': 'success', 'message': f'Noise level set to {level}'}
+        
+        return {'status': 'error', 'message': 'Unknown command'}
+
+    def _get_cpu_temperature(self) -> float:
+        """Получение температуры CPU"""
+        try:
+            return psutil.sensors_temperatures()['coretemp'][0].current
+        except:
+            return 0.0
+
+    async def start(self):
+        """Запуск веб-интерфейса"""
+        runner = web.AppRunner(self.app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', self.config.web_port)
+        await site.start()
+        logger.info(f"Web interface started on port {self.config.web_port}")
+
+# ======================
+# 4. ОСНОВНОЙ ПРОЦЕССОР
+# ======================
+
+class QuantumRussianProcessor:
+    def __init__(self, config: QRSConfig):
+        self.config = config
+        self.comm = MPI.COMM_WORLD if config.use_mpi else None
+        self.security = QuantumSecurityEngine(config)
+        self.modules = self._init_modules()
+        self.web_interface = QuantumWebInterface(self, config) if config.web_interface else None
+        self._init_hardware()
+        self._setup_signal_handlers()
+
+    def _init_modules(self) -> Dict:
+        """Инициализация всех активных модулей"""
+        modules = {}
+        
+        if self.config.modules['qaoa']['enabled']:
+            from .qaoa_optimizer import QAOAOptimizer
+            modules['qaoa'] = QAOAOptimizer(self.config)
+        
+        if self.config.modules['qkd']['enabled']:
+            from .qkd_engine import QKDEngine
+            modules['qkd'] = QKDEngine(self.config, self.security)
+        
+        if self.config.modules['qudit']['enabled']:
+            from .qudit_processor import QuditProcessor
+            modules['qudit'] = QuditProcessor(self.config)
+        
+        return modules
+
+    def _init_hardware(self):
+        """Инициализация аппаратных ускорителей"""
+        if self.config.russian_tech:
+            try:
+                from elbrus_optimizer import apply_hardware_optimizations
+                apply_hardware_optimizations(self)
+                logger.info("Elbrus optimizations applied")
+            except ImportError:
+                logger.warning("Elbrus optimizations not available")
+        
+        if self.config.use_gpu and torch.cuda.is_available():
+            torch.cuda.set_device(0)
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            logger.info("Using CPU for computations")
+
+    def _setup_signal_handlers(self):
+        """Настройка обработчиков сигналов"""
+        import signal
+        signal.signal(signal.SIGINT, self._handle_shutdown)
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+
+    def _handle_shutdown(self, signum, frame):
+        """Обработка завершения работы"""
+        logger.info(f"Received shutdown signal {signum}")
+        asyncio.create_task(self.shutdown())
+
+    async def start(self):
+        """Запуск системы"""
+        logger.info("Starting Quantum Russian Stack")
+        
+        # Запуск ротации ключей
+        await self.security.start_key_rotation()
+        
+        # Запуск веб-интерфейса
+        if self.web_interface:
+            await self.web_interface.start()
+        
+        # Запуск модулей
+        for name, module in self.modules.items():
+            if hasattr(module, 'start'):
+                await module.start()
+        
+        logger.info("System startup completed")
+
+    async def shutdown(self):
+        """Корректное завершение работы"""
+        logger.info("Shutting down Quantum Russian Stack")
+        
+        # Остановка модулей
+        for name, module in self.modules.items():
+            if hasattr(module, 'shutdown'):
+                await module.shutdown()
+        
+        # Остановка задач
+        if self.security.rotation_task:
+            self.security.rotation_task.cancel()
+        
+        logger.info("System shutdown completed")
+        os._exit(0)
+
+# ======================
+# 5. ИНТЕРФЕЙС РАЗВЕРТЫВАНИЯ
+# ======================
+
+class IndustrialQRS:
+    @staticmethod
+    def create(config: Union[QRSConfig, Dict, str] = None) -> QuantumRussianProcessor:
+        """Фабричный метод для создания экземпляра системы"""
+        if isinstance(config, str):
+            with open(config, 'r') as f:
+                if config.endswith('.json'):
+                    config = json.load(f)
+                else:
+                    config = yaml.safe_load(f)
+        
+        if isinstance(config, dict):
+            config = QRSConfig(**config)
+        
+        config = config or QRSConfig()
+        
+        # Автоконфигурация оборудования
+        if config.use_gpu and not torch.cuda.is_available():
+            config.use_gpu = False
+            logger.warning("GPU acceleration not available, falling back to CPU")
+        
+        return QuantumRussianProcessor(config)
+
+# ======================
+# 6. ЗАПУСК СИСТЕМЫ
+# ======================
+
+async def main():
+    """Точка входа системы"""
+    try:
+        # Загрузка конфигурации
+        config_path = os.getenv('QRS_CONFIG', 'config.yaml')
+        qrs = IndustrialQRS.create(config_path)
+        
+        # Запуск системы
+        await qrs.start()
+        
+        # Бесконечный цикл
+        while True:
+            await asyncio.sleep(3600)  # Просто ждем
+            
+    except Exception as e:
+        logger.critical(f"Fatal error: {str(e)}", exc_info=True)
+        await qrs.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
