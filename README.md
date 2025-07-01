@@ -1,3 +1,5 @@
+**Тестовая сборка**
+
 ```markdown
 # Quantum Russian Stack (QRS) 🚀
 
