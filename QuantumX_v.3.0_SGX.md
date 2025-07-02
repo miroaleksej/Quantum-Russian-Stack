@@ -1,5 +1,3 @@
-Реализуем модуль SGX (Intel Software Guard Extensions) для QuantumX, обеспечивающий защиту квантовых состояний и ключей. Так как SGX требует специфического железа, добавим эмуляцию для разработки и реальную реализацию для production.
-
 ### 1. Реализация SGX-модуля для QuantumX
 
 **Файл**: `quantumx-core/src/security/sgx.rs`
